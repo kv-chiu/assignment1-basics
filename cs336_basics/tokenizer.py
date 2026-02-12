@@ -1,6 +1,5 @@
 import os
 from collections import Counter, defaultdict
-from multiprocessing import Pool
 
 import regex as re
 
@@ -8,34 +7,71 @@ import regex as re
 GPT2_PATTERN = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 
-def _pretokenize_chunk(chunk: str) -> list[str]:
-    return [m.group() for m in GPT2_PATTERN.finditer(chunk)]
-
-
 def train_bpe(
     input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    # 1. Read the text file
-    with open(input_path, encoding="utf-8") as f:
-        text = f.read()
+    # 1-3. Stream pretokenization into counts; avoid storing the full text
+    word_counts: Counter[bytes] = Counter()
 
-    # 2. Split by special_tokens
+    def _consume_segment(segment: str, carry: str, flush: bool) -> str:
+        if not segment and not carry:
+            return ""
+        buffer = carry + segment
+        last_match = None
+        for match in GPT2_PATTERN.finditer(buffer):
+            if last_match is not None:
+                word_counts[last_match.group().encode("utf-8")] += 1
+            last_match = match
+        if last_match is None:
+            return buffer if not flush else ""
+        if flush or last_match.end() < len(buffer):
+            word_counts[last_match.group().encode("utf-8")] += 1
+            return "" if last_match.end() == len(buffer) else buffer[last_match.end() :]
+        return buffer[last_match.start() :]
+
+    chunk_size = 1 << 20
     if special_tokens:
         special_pattern = "|".join(re.escape(t) for t in special_tokens)
-        raw_chunks = re.split(f"({special_pattern})", text)
+        special_regex = re.compile(special_pattern)
+        max_special_len = max(len(t) for t in special_tokens)
+        buffer = ""
+        carry = ""
+        with open(input_path, encoding="utf-8") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                buffer += chunk
+                scan_upto = len(buffer) - (max_special_len - 1)
+                if scan_upto <= 0:
+                    continue
+                last_idx = 0
+                for match in special_regex.finditer(buffer):
+                    if match.start() >= scan_upto:
+                        break
+                    if match.start() > last_idx:
+                        carry = _consume_segment(buffer[last_idx:match.start()], carry, flush=False)
+                    carry = _consume_segment("", carry, flush=True)
+                    last_idx = match.end()
+                if last_idx > 0:
+                    buffer = buffer[last_idx:]
+                else:
+                    carry = _consume_segment(buffer[:scan_upto], carry, flush=False)
+                    buffer = buffer[scan_upto:]
+        if buffer:
+            carry = _consume_segment(buffer, carry, flush=False)
+        if carry:
+            carry = _consume_segment("", carry, flush=True)
     else:
-        raw_chunks = [text]
-
-    # 3. Pretokenization
-    special_set = set(special_tokens)
-    chunks_to_process = [c for c in raw_chunks if c and c not in special_set]
-
-    with Pool() as pool:
-        results = pool.map(_pretokenize_chunk, chunks_to_process)
-
-    words = []
-    for result in results:
-        words.extend(result)
+        carry = ""
+        with open(input_path, encoding="utf-8") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                carry = _consume_segment(chunk, carry, flush=False)
+        if carry:
+            carry = _consume_segment("", carry, flush=True)
 
     # 4. Initialization
     # Basic 256 bytes
@@ -43,20 +79,27 @@ def train_bpe(
     # Add special tokens to vocab
     for idx, token in enumerate(special_tokens):
         vocab[256 + idx] = token.encode("utf-8")
-    byte_chunks = [list(word.encode("utf-8")) for word in words]
+
+    # Collapse duplicate words to avoid per-occurrence storage
+    word_symbols: list[list[int]] = []
+    word_freqs: list[int] = []
+    for word_bytes, freq in word_counts.items():
+        word_symbols.append(list(word_bytes))
+        word_freqs.append(freq)
 
     # 5. Merge
     num_merges = vocab_size - 256 - len(special_tokens)
     merges = []
 
-    counts = Counter()
-    pair_to_chunks = defaultdict(set)  # pair -> set of chunk indices containing it
+    counts: Counter[tuple[int, int]] = Counter()
+    pair_to_words: defaultdict[tuple[int, int], set[int]] = defaultdict(set)
 
-    for ci, chunk in enumerate(byte_chunks):
-        for j in range(len(chunk) - 1):
-            pair = (chunk[j], chunk[j + 1])
-            counts[pair] += 1
-            pair_to_chunks[pair].add(ci)
+    for wi, symbols in enumerate(word_symbols):
+        freq = word_freqs[wi]
+        for j in range(len(symbols) - 1):
+            pair = (symbols[j], symbols[j + 1])
+            counts[pair] += freq
+            pair_to_words[pair].add(wi)
 
     # 6. Compute
     for i in range(num_merges):
@@ -71,41 +114,42 @@ def train_bpe(
 
         a, b = best_pair
 
-        # Only process chunks that contain the best pair (skip all others)
-        affected = list(pair_to_chunks.get(best_pair, []))
+        # Only process words that contain the best pair (skip all others)
+        affected = list(pair_to_words.get(best_pair, []))
 
-        for ci in affected:
-            chunk = byte_chunks[ci]
+        for wi in affected:
+            symbols = word_symbols[wi]
+            freq = word_freqs[wi]
 
             # Remove old pairs from counts and index
-            for j in range(len(chunk) - 1):
-                pair = (chunk[j], chunk[j + 1])
-                counts[pair] -= 1
+            for j in range(len(symbols) - 1):
+                pair = (symbols[j], symbols[j + 1])
+                counts[pair] -= freq
                 if counts[pair] <= 0:
                     del counts[pair]
-                if pair in pair_to_chunks:
-                    pair_to_chunks[pair].discard(ci)
-                    if not pair_to_chunks[pair]:
-                        del pair_to_chunks[pair]
+                if pair in pair_to_words:
+                    pair_to_words[pair].discard(wi)
+                    if not pair_to_words[pair]:
+                        del pair_to_words[pair]
 
             # Build merged chunk
-            new_chunk = []
+            new_symbols = []
             j = 0
-            while j < len(chunk):
-                if j < len(chunk) - 1 and chunk[j] == a and chunk[j + 1] == b:
-                    new_chunk.append(new_token_id)
+            while j < len(symbols):
+                if j < len(symbols) - 1 and symbols[j] == a and symbols[j + 1] == b:
+                    new_symbols.append(new_token_id)
                     j += 2
                 else:
-                    new_chunk.append(chunk[j])
+                    new_symbols.append(symbols[j])
                     j += 1
 
             # Add new pairs to counts and index
-            for j in range(len(new_chunk) - 1):
-                pair = (new_chunk[j], new_chunk[j + 1])
-                counts[pair] += 1
-                pair_to_chunks[pair].add(ci)
+            for j in range(len(new_symbols) - 1):
+                pair = (new_symbols[j], new_symbols[j + 1])
+                counts[pair] += freq
+                pair_to_words[pair].add(wi)
 
-            byte_chunks[ci] = new_chunk
+            word_symbols[wi] = new_symbols
 
     final_merges = [(vocab[p[0]], vocab[p[1]]) for p in merges]
 
