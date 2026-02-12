@@ -1,3 +1,4 @@
+import heapq
 import os
 from collections import Counter, defaultdict
 
@@ -75,10 +76,17 @@ def train_bpe(
 
     # 4. Initialization
     # Basic 256 bytes
+    def _inv_key(token_bytes: bytes) -> tuple[int, ...]:
+        # Reverse lexicographic order with an explicit terminator so prefixes sort after longer bytes.
+        return tuple(255 - b for b in token_bytes) + (256,)
+
     vocab = {i: bytes([i]) for i in range(256)}
+    inv_vocab = [_inv_key(bytes([i])) for i in range(256)]
     # Add special tokens to vocab
     for idx, token in enumerate(special_tokens):
-        vocab[256 + idx] = token.encode("utf-8")
+        token_bytes = token.encode("utf-8")
+        vocab[256 + idx] = token_bytes
+        inv_vocab.append(_inv_key(token_bytes))
 
     # Collapse duplicate words to avoid per-occurrence storage
     word_symbols: list[list[int]] = []
@@ -101,16 +109,36 @@ def train_bpe(
             counts[pair] += freq
             pair_to_words[pair].add(wi)
 
+    heap: list[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, int]]] = []
+    for pair, count in counts.items():
+        heapq.heappush(
+            heap,
+            (-count, inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
+        )
+
+    def _pop_best_pair() -> tuple[int, int] | None:
+        while heap:
+            neg_count, _inv_a, _inv_b, pair = heapq.heappop(heap)
+            current = counts.get(pair)
+            if current is None:
+                continue
+            if -neg_count != current:
+                continue
+            return pair
+        return None
+
     # 6. Compute
     for i in range(num_merges):
         if not counts:
             break
-
-        best_pair = max(counts, key=lambda p: (counts[p], vocab[p[0]], vocab[p[1]]))
+        best_pair = _pop_best_pair()
+        if best_pair is None:
+            break
         new_token_id = 256 + len(special_tokens) + i
 
         merges.append(best_pair)
         vocab[new_token_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
+        inv_vocab.append(_inv_key(vocab[new_token_id]))
 
         a, b = best_pair
 
@@ -131,6 +159,11 @@ def train_bpe(
                     pair_to_words[pair].discard(wi)
                     if not pair_to_words[pair]:
                         del pair_to_words[pair]
+                if pair in counts:
+                    heapq.heappush(
+                        heap,
+                        (-counts[pair], inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
+                    )
 
             # Build merged chunk
             new_symbols = []
@@ -148,6 +181,10 @@ def train_bpe(
                 pair = (new_symbols[j], new_symbols[j + 1])
                 counts[pair] += freq
                 pair_to_words[pair].add(wi)
+                heapq.heappush(
+                    heap,
+                    (-counts[pair], inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
+                )
 
             word_symbols[wi] = new_symbols
 
