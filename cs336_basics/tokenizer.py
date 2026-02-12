@@ -54,7 +54,7 @@ def train_bpe(
         if not counts:
             break
 
-        best_pair = max(counts, key=lambda x: (counts[x], x))
+        best_pair = max(counts, key=lambda p: (counts[p], vocab[p[0]], vocab[p[1]]))
         new_token_id = 256 + len(special_tokens) + i
 
         merges.append(best_pair)
