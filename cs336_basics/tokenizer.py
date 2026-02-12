@@ -31,6 +31,9 @@ def train_bpe(
     # 4. Initialization
     # Basic 256 bytes
     vocab = {i: bytes([i]) for i in range(256)}
+    # Add special tokens to vocab
+    for idx, token in enumerate(special_tokens):
+        vocab[256 + idx] = token.encode("utf-8")
     byte_chunks = [list(word.encode("utf-8")) for word in words]
 
     # 5. Merge
@@ -52,7 +55,7 @@ def train_bpe(
             break
 
         best_pair = max(counts, key=lambda x: (counts[x], x))
-        new_token_id = 255 + len(special_tokens) + i
+        new_token_id = 256 + len(special_tokens) + i
 
         merges.append(best_pair)
         vocab[new_token_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
