@@ -101,17 +101,16 @@ def train_bpe(
 
     counts: Counter[tuple[int, int]] = Counter()
     pair_to_words: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
-    word_pair_counts: list[Counter[tuple[int, int]]] = []
 
     for wi, symbols in enumerate(word_symbols):
         freq = word_freqs[wi]
-        pair_counts: Counter[tuple[int, int]] = Counter()
+        seen_pairs: set[tuple[int, int]] = set()
         for j in range(len(symbols) - 1):
-            pair_counts[(symbols[j], symbols[j + 1])] += 1
-        word_pair_counts.append(pair_counts)
-        for pair, pair_count in pair_counts.items():
-            counts[pair] += pair_count * freq
-            pair_to_words[pair].append(wi)
+            pair = (symbols[j], symbols[j + 1])
+            counts[pair] += freq
+            if pair not in seen_pairs:
+                pair_to_words[pair].append(wi)
+                seen_pairs.add(pair)
 
     heap: list[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, int]]] = []
     for pair, count in counts.items():
@@ -158,7 +157,9 @@ def train_bpe(
             freq = word_freqs[wi]
 
             # Remove old pairs from counts and index
-            old_pair_counts = word_pair_counts[wi]
+            old_pair_counts: Counter[tuple[int, int]] = Counter()
+            for j in range(len(symbols) - 1):
+                old_pair_counts[(symbols[j], symbols[j + 1])] += 1
             for pair, pair_count in old_pair_counts.items():
                 counts[pair] -= pair_count * freq
                 if counts[pair] <= 0:
@@ -196,7 +197,6 @@ def train_bpe(
                 )
 
             word_symbols[wi] = new_symbols
-            word_pair_counts[wi] = new_pair_counts
 
     final_merges = [(vocab[p[0]], vocab[p[1]]) for p in merges]
 
