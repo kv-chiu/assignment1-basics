@@ -100,14 +100,17 @@ def train_bpe(
     merges = []
 
     counts: Counter[tuple[int, int]] = Counter()
-    pair_to_words: defaultdict[tuple[int, int], set[int]] = defaultdict(set)
+    pair_to_words: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
 
     for wi, symbols in enumerate(word_symbols):
         freq = word_freqs[wi]
+        seen_pairs: set[tuple[int, int]] = set()
         for j in range(len(symbols) - 1):
             pair = (symbols[j], symbols[j + 1])
             counts[pair] += freq
-            pair_to_words[pair].add(wi)
+            if pair not in seen_pairs:
+                pair_to_words[pair].append(wi)
+                seen_pairs.add(pair)
 
     heap: list[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, int]]] = []
     for pair, count in counts.items():
@@ -143,9 +146,13 @@ def train_bpe(
         a, b = best_pair
 
         # Only process words that contain the best pair (skip all others)
-        affected = list(pair_to_words.get(best_pair, []))
+        affected = pair_to_words.get(best_pair, [])
+        seen_words: set[int] = set()
 
         for wi in affected:
+            if wi in seen_words:
+                continue
+            seen_words.add(wi)
             symbols = word_symbols[wi]
             freq = word_freqs[wi]
 
@@ -155,10 +162,6 @@ def train_bpe(
                 counts[pair] -= freq
                 if counts[pair] <= 0:
                     del counts[pair]
-                if pair in pair_to_words:
-                    pair_to_words[pair].discard(wi)
-                    if not pair_to_words[pair]:
-                        del pair_to_words[pair]
                 if pair in counts:
                     heapq.heappush(
                         heap,
@@ -177,10 +180,13 @@ def train_bpe(
                     j += 1
 
             # Add new pairs to counts and index
+            new_seen_pairs: set[tuple[int, int]] = set()
             for j in range(len(new_symbols) - 1):
                 pair = (new_symbols[j], new_symbols[j + 1])
                 counts[pair] += freq
-                pair_to_words[pair].add(wi)
+                if pair not in new_seen_pairs:
+                    pair_to_words[pair].append(wi)
+                    new_seen_pairs.add(pair)
                 heapq.heappush(
                     heap,
                     (-counts[pair], inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
