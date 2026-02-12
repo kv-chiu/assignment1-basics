@@ -1,7 +1,15 @@
 import os
 from collections import Counter, defaultdict
+from multiprocessing import Pool
 
 import regex as re
+
+# Refer to https://github.com/openai/tiktoken/pull/234/changes
+GPT2_PATTERN = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+
+def _pretokenize_chunk(chunk: str) -> list[str]:
+    return [m.group() for m in GPT2_PATTERN.finditer(chunk)]
 
 
 def train_bpe(
@@ -18,15 +26,16 @@ def train_bpe(
     else:
         raw_chunks = [text]
 
-    # 3. Capture by gpt2pattern
-    # Refer to https://github.com/openai/tiktoken/pull/234/changes
-    gpt2_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    # 3. Pretokenization
+    special_set = set(special_tokens)
+    chunks_to_process = [c for c in raw_chunks if c and c not in special_set]
+
+    with Pool() as pool:
+        results = pool.map(_pretokenize_chunk, chunks_to_process)
 
     words = []
-    for chunk in raw_chunks:
-        if not chunk or chunk in special_tokens:
-            continue
-        words.extend(re.findall(gpt2_pattern, chunk))
+    for result in results:
+        words.extend(result)
 
     # 4. Initialization
     # Basic 256 bytes
