@@ -1,229 +1,126 @@
-import heapq
 import os
 from collections import Counter, defaultdict
 
 import regex as re
 
-# Refer to https://github.com/openai/tiktoken/pull/234/changes
-GPT2_PATTERN = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+
+def bytes2unicode():
+    printable = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    mapping = {b: chr(b) for b in printable}
+    i = 0
+    for x in range(256):
+        if x not in mapping:
+            mapping[x] = chr(i + 256)
+            i += 1
+    return mapping
 
 
 def train_bpe(
-    input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    # 1-3. Stream pretokenization into counts; avoid storing the full text
-    word_counts: Counter[bytes] = Counter()
-
-    def _consume_segment(segment: str, carry: str, flush: bool) -> str:
-        if not segment and not carry:
-            return ""
-        buffer = carry + segment
-        last_match = None
-        for match in GPT2_PATTERN.finditer(buffer):
-            if last_match is not None:
-                word_counts[last_match.group().encode("utf-8")] += 1
-            last_match = match
-        if last_match is None:
-            return buffer if not flush else ""
-        if flush or last_match.end() < len(buffer):
-            word_counts[last_match.group().encode("utf-8")] += 1
-            return "" if last_match.end() == len(buffer) else buffer[last_match.end() :]
-        return buffer[last_match.start() :]
-
-    chunk_size = 1 << 20
-    if special_tokens:
-        special_pattern = "|".join(re.escape(t) for t in special_tokens)
-        special_regex = re.compile(special_pattern)
-        max_special_len = max(len(t) for t in special_tokens)
-        buffer = ""
-        carry = ""
-        with open(input_path, encoding="utf-8") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                buffer += chunk
-                scan_upto = len(buffer) - (max_special_len - 1)
-                if scan_upto <= 0:
-                    continue
-                last_idx = 0
-                for match in special_regex.finditer(buffer):
-                    if match.start() >= scan_upto:
-                        break
-                    if match.start() > last_idx:
-                        carry = _consume_segment(buffer[last_idx:match.start()], carry, flush=False)
-                    carry = _consume_segment("", carry, flush=True)
-                    last_idx = match.end()
-                if last_idx > 0:
-                    buffer = buffer[last_idx:]
-                else:
-                    carry = _consume_segment(buffer[:scan_upto], carry, flush=False)
-                    buffer = buffer[scan_upto:]
-        if buffer:
-            carry = _consume_segment(buffer, carry, flush=False)
-        if carry:
-            carry = _consume_segment("", carry, flush=True)
-    else:
-        carry = ""
-        with open(input_path, encoding="utf-8") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                carry = _consume_segment(chunk, carry, flush=False)
-        if carry:
-            carry = _consume_segment("", carry, flush=True)
-
-    # 4. Initialization
-    # Basic 256 bytes
-    def _inv_key(token_bytes: bytes) -> tuple[int, ...]:
-        # Reverse lexicographic order with an explicit terminator so prefixes sort after longer bytes.
-        return tuple(255 - b for b in token_bytes) + (256,)
 
     vocab = {i: bytes([i]) for i in range(256)}
-    inv_vocab = [_inv_key(bytes([i])) for i in range(256)]
-    # Add special tokens to vocab
-    for idx, token in enumerate(special_tokens):
-        token_bytes = token.encode("utf-8")
-        vocab[256 + idx] = token_bytes
-        inv_vocab.append(_inv_key(token_bytes))
-
-    # Collapse duplicate words to avoid per-occurrence storage
-    word_symbols: list[list[int]] = []
-    word_freqs: list[int] = []
-    for word_bytes, freq in word_counts.items():
-        word_symbols.append(list(word_bytes))
-        word_freqs.append(freq)
-    word_next: list[list[int]] = []
-    word_prev: list[list[int]] = []
-    word_alive: list[list[bool]] = []
-    for symbols in word_symbols:
-        n = len(symbols)
-        if n == 0:
-            word_next.append([])
-            word_prev.append([])
-            word_alive.append([])
-            continue
-        word_next.append([i + 1 for i in range(n - 1)] + [-1])
-        word_prev.append([-1] + [i for i in range(n - 1)])
-        word_alive.append([True] * n)
-
-    # 5. Merge
     num_merges = vocab_size - 256 - len(special_tokens)
+
+    with open(input_path, encoding="utf-8") as file:
+        text = file.read()
+
+    if special_tokens:
+        special_regex = "|".join(re.escape(token) for token in special_tokens)
+        parts = re.split(f"({special_regex})", text)
+
+        train_segments = [p for p in parts if p not in special_tokens]
+    else:
+        train_segments = [text]
+
+    coarse_count = Counter()
+
+    for segment in train_segments:
+        for word in PAT.finditer(segment):
+            coarse_count[tuple(bytes([byte]) for byte in word.group().encode("utf-8"))] += 1
+
+    words_list = []
+    count_list = []
+
+    for word, freq in coarse_count.items():
+        words_list.append(list(word))
+        count_list.append(freq)
+
+    freq_merges = defaultdict(int)
+    idx_merges = defaultdict(set)
+
+    for idx, word in enumerate(words_list):
+        freq = count_list[idx]
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i + 1])
+            freq_merges[pair] += freq
+            idx_merges[pair].add(idx)
+
     merges = []
 
-    counts: Counter[tuple[int, int]] = Counter()
-    pair_to_occurrences: defaultdict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
-
-    for wi, symbols in enumerate(word_symbols):
-        freq = word_freqs[wi]
-        for j in range(len(symbols) - 1):
-            pair = (symbols[j], symbols[j + 1])
-            counts[pair] += freq
-            pair_to_occurrences[pair].append((wi, j))
-
-    heap: list[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, int]]] = []
-    for pair, count in counts.items():
-        heapq.heappush(
-            heap,
-            (-count, inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
-        )
-
-    def _pop_best_pair() -> tuple[int, int] | None:
-        while heap:
-            neg_count, _inv_a, _inv_b, pair = heapq.heappop(heap)
-            current = counts.get(pair)
-            if current is None:
-                continue
-            if -neg_count != current:
-                continue
-            return pair
-        return None
-
-    def _adjust_pair(pair: tuple[int, int], delta: int) -> None:
-        if delta == 0:
-            return
-        new_count = counts.get(pair, 0) + delta
-        if new_count <= 0:
-            if pair in counts:
-                del counts[pair]
-            return
-        counts[pair] = new_count
-        heapq.heappush(heap, (-new_count, inv_vocab[pair[0]], inv_vocab[pair[1]], pair))
-
-    # 6. Compute
-    for i in range(num_merges):
-        if not counts:
+    for _ in range(num_merges):
+        if not freq_merges:
             break
-        best_pair = _pop_best_pair()
-        if best_pair is None:
+
+        most_pair = max(freq_merges.items(), key=lambda x: (x[1], x[0]))[0]
+
+        if freq_merges[most_pair] <= 0:
             break
-        new_token_id = 256 + len(special_tokens) + i
 
-        merges.append(best_pair)
-        vocab[new_token_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
-        inv_vocab.append(_inv_key(vocab[new_token_id]))
+        merges.append(most_pair)
+        new_token = most_pair[0] + most_pair[1]
 
-        a, b = best_pair
+        rel_idx = list(idx_merges[most_pair])
 
-        # Only process words that contain the best pair (skip all others)
-        occurrences = pair_to_occurrences.get(best_pair, [])
-        affected_positions: dict[int, list[int]] = {}
-        for wi, pos in occurrences:
-            if not word_alive[wi][pos]:
-                continue
-            j = word_next[wi][pos]
-            if j == -1:
-                continue
-            if word_symbols[wi][pos] != a or word_symbols[wi][j] != b:
-                continue
-            if word_prev[wi][j] != pos:
-                continue
-            affected_positions.setdefault(wi, []).append(pos)
+        for idx in rel_idx:
+            word = words_list[idx]
+            freq = count_list[idx]
 
-        for wi, positions in affected_positions.items():
-            positions.sort()
-            freq = word_freqs[wi]
-            for pos in positions:
-                if not word_alive[wi][pos]:
-                    continue
-                j = word_next[wi][pos]
-                if j == -1:
-                    continue
-                if word_symbols[wi][pos] != a or word_symbols[wi][j] != b:
-                    continue
-                if word_prev[wi][j] != pos:
-                    continue
+            i = 0
+            while i < len(word) - 1:
+                if word[i] == most_pair[0] and word[i + 1] == most_pair[1]:
+                    if i > 0:
+                        prev_pair = (word[i - 1], word[i])
+                        freq_merges[prev_pair] -= freq
+                        if freq_merges == 0:
+                            del freq_merges[prev_pair]
 
-                prev_idx = word_prev[wi][pos]
-                next_idx = word_next[wi][j]
+                    if i < len(word) - 2:
+                        next_pair = (word[i + 1], word[i + 2])
+                        freq_merges[next_pair] -= freq
+                        if freq_merges == 0:
+                            del freq_merges[next_pair]
 
-                # Remove old pairs from counts
-                _adjust_pair((a, b), -freq)
-                if prev_idx != -1:
-                    _adjust_pair((word_symbols[wi][prev_idx], a), -freq)
-                if next_idx != -1:
-                    _adjust_pair((b, word_symbols[wi][next_idx]), -freq)
+                    word[i] = new_token
+                    del word[i + 1]
 
-                # Merge nodes pos and j
-                word_symbols[wi][pos] = new_token_id
-                word_alive[wi][j] = False
-                word_prev[wi][j] = -1
-                word_next[wi][j] = -1
-                word_next[wi][pos] = next_idx
-                if next_idx != -1:
-                    word_prev[wi][next_idx] = pos
+                    if i > 0:
+                        prev_pair = (word[i - 1], word[i])
+                        freq_merges[prev_pair] += freq
+                        idx_merges[prev_pair].add(idx)
 
-                # Add new pairs to counts and index
-                if prev_idx != -1:
-                    new_left = (word_symbols[wi][prev_idx], new_token_id)
-                    _adjust_pair(new_left, freq)
-                    pair_to_occurrences[new_left].append((wi, prev_idx))
-                if next_idx != -1:
-                    new_right = (new_token_id, word_symbols[wi][next_idx])
-                    _adjust_pair(new_right, freq)
-                    pair_to_occurrences[new_right].append((wi, pos))
+                    if i < len(word) - 1:
+                        next_pair = (word[i], word[i + 1])
+                        freq_merges[next_pair] += freq
+                        idx_merges[next_pair].add(idx)
+                else:
+                    i += 1
 
-    final_merges = [(vocab[p[0]], vocab[p[1]]) for p in merges]
+        if most_pair in freq_merges:
+            del freq_merges[most_pair]
+        if most_pair in idx_merges:
+            del idx_merges[most_pair]
 
-    return vocab, final_merges
+    for pair in merges:
+        new_idx = len(vocab)
+        vocab[new_idx] = pair[0] + pair[1]
+
+    for spec_token in special_tokens:
+        spec_bytes = spec_token.encode("utf-8")
+        vocab[len(vocab)] = spec_bytes
+
+    return vocab, merges
