@@ -1,5 +1,5 @@
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 
 import regex as re
 
@@ -37,16 +37,17 @@ def train_bpe(
     num_merges = vocab_size - 256 - len(special_tokens)
     merges = []
 
-    # Compute
-    for i in range(num_merges):
-        counts = Counter()
-        for chunk in byte_chunks:
-            if len(chunk) < 2:
-                continue
-            for j in range(len(chunk) - 1):
-                counts[(chunk[j], chunk[j + 1])] += 1
+    counts = Counter()
+    pair_to_chunks = defaultdict(set)  # pair -> set of chunk indices containing it
 
-        # Exit while Counter is empty
+    for ci, chunk in enumerate(byte_chunks):
+        for j in range(len(chunk) - 1):
+            pair = (chunk[j], chunk[j + 1])
+            counts[pair] += 1
+            pair_to_chunks[pair].add(ci)
+
+    # 6. Compute
+    for i in range(num_merges):
         if not counts:
             break
 
@@ -56,19 +57,43 @@ def train_bpe(
         merges.append(best_pair)
         vocab[new_token_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
 
-        new_byte_chunks = []
-        for chunk in byte_chunks:
+        a, b = best_pair
+
+        # Only process chunks that contain the best pair (skip all others)
+        affected = list(pair_to_chunks.get(best_pair, []))
+
+        for ci in affected:
+            chunk = byte_chunks[ci]
+
+            # Remove old pairs from counts and index
+            for j in range(len(chunk) - 1):
+                pair = (chunk[j], chunk[j + 1])
+                counts[pair] -= 1
+                if counts[pair] <= 0:
+                    del counts[pair]
+                if pair in pair_to_chunks:
+                    pair_to_chunks[pair].discard(ci)
+                    if not pair_to_chunks[pair]:
+                        del pair_to_chunks[pair]
+
+            # Build merged chunk
             new_chunk = []
-            idx = 0
-            while idx < len(chunk):
-                if idx < len(chunk) - 1 and (chunk[idx], chunk[idx + 1]) == best_pair:
+            j = 0
+            while j < len(chunk):
+                if j < len(chunk) - 1 and chunk[j] == a and chunk[j + 1] == b:
                     new_chunk.append(new_token_id)
-                    idx += 2
+                    j += 2
                 else:
-                    new_chunk.append(chunk[idx])
-                    idx += 1
-            new_byte_chunks.append(new_chunk)
-        byte_chunks = new_byte_chunks
+                    new_chunk.append(chunk[j])
+                    j += 1
+
+            # Add new pairs to counts and index
+            for j in range(len(new_chunk) - 1):
+                pair = (new_chunk[j], new_chunk[j + 1])
+                counts[pair] += 1
+                pair_to_chunks[pair].add(ci)
+
+            byte_chunks[ci] = new_chunk
 
     final_merges = [(vocab[p[0]], vocab[p[1]]) for p in merges]
 
