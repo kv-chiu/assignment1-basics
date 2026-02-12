@@ -1,0 +1,32 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+\title{CS336 Assignment 1 Basics Writeup}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section*{Problem (unicode1): Understanding Unicode}
+
+\begin{enumerate}
+    \item[(a)] \texttt{chr(0)} returns the Null character (U+0000).
+    \item[(b)] The string representation (\texttt{\_\_repr\_\_()}) displays the escaped hex code \texttt{'\\x00'}, whereas the printed representation outputs the actual invisible control character.
+    \item[(c)] When this character occurs in a Python string, it behaves as a normal character (increasing length without terminating the string) but is typically invisible when printed to the console.
+\end{enumerate}
+
+\section*{Problem (unicode2): Unicode Encodings}
+
+\begin{enumerate}
+    \item[(a)] UTF-8 is preferred because it is variable-width and highly space-efficient for ASCII characters (using 1 byte vs 2-4 bytes in UTF-16/32), which dominate most training corpora (like English text and code), and it avoids the issue of null-byte sparsity found in fixed-width encodings.
+    \item[(b)] "A中😀". The function fails to decode the bytes correctly because it does not handle multi-byte characters properly. It attempts to decode each byte as a separate character, which can lead to errors or unexpected results.
+    \item[(c)] "\xe4\x00". The sequence starts with "\xe4"(11100100), implicating that it is a 3-byte sequence. However, the second byte is "\x00"(00000000) instead of "10xxxxxx", so it is not a valid UTF-8 encoding of a character, and there are only two bytes available to decode.
+\end{enumerate}
+
+\section*{Problem (train_bpe): BPE Tokenizer Training}
+
+\end{document}
