@@ -94,23 +94,33 @@ def train_bpe(
     for word_bytes, freq in word_counts.items():
         word_symbols.append(list(word_bytes))
         word_freqs.append(freq)
+    word_next: list[list[int]] = []
+    word_prev: list[list[int]] = []
+    word_alive: list[list[bool]] = []
+    for symbols in word_symbols:
+        n = len(symbols)
+        if n == 0:
+            word_next.append([])
+            word_prev.append([])
+            word_alive.append([])
+            continue
+        word_next.append([i + 1 for i in range(n - 1)] + [-1])
+        word_prev.append([-1] + [i for i in range(n - 1)])
+        word_alive.append([True] * n)
 
     # 5. Merge
     num_merges = vocab_size - 256 - len(special_tokens)
     merges = []
 
     counts: Counter[tuple[int, int]] = Counter()
-    pair_to_words: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
+    pair_to_occurrences: defaultdict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
 
     for wi, symbols in enumerate(word_symbols):
         freq = word_freqs[wi]
-        seen_pairs: set[tuple[int, int]] = set()
         for j in range(len(symbols) - 1):
             pair = (symbols[j], symbols[j + 1])
             counts[pair] += freq
-            if pair not in seen_pairs:
-                pair_to_words[pair].append(wi)
-                seen_pairs.add(pair)
+            pair_to_occurrences[pair].append((wi, j))
 
     heap: list[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, int]]] = []
     for pair, count in counts.items():
@@ -130,6 +140,17 @@ def train_bpe(
             return pair
         return None
 
+    def _adjust_pair(pair: tuple[int, int], delta: int) -> None:
+        if delta == 0:
+            return
+        new_count = counts.get(pair, 0) + delta
+        if new_count <= 0:
+            if pair in counts:
+                del counts[pair]
+            return
+        counts[pair] = new_count
+        heapq.heappush(heap, (-new_count, inv_vocab[pair[0]], inv_vocab[pair[1]], pair))
+
     # 6. Compute
     for i in range(num_merges):
         if not counts:
@@ -146,57 +167,62 @@ def train_bpe(
         a, b = best_pair
 
         # Only process words that contain the best pair (skip all others)
-        affected = pair_to_words.get(best_pair, [])
-        seen_words: set[int] = set()
-
-        for wi in affected:
-            if wi in seen_words:
+        occurrences = pair_to_occurrences.get(best_pair, [])
+        affected_positions: dict[int, list[int]] = {}
+        for wi, pos in occurrences:
+            if not word_alive[wi][pos]:
                 continue
-            seen_words.add(wi)
-            symbols = word_symbols[wi]
+            j = word_next[wi][pos]
+            if j == -1:
+                continue
+            if word_symbols[wi][pos] != a or word_symbols[wi][j] != b:
+                continue
+            if word_prev[wi][j] != pos:
+                continue
+            affected_positions.setdefault(wi, []).append(pos)
+
+        for wi, positions in affected_positions.items():
+            positions.sort()
             freq = word_freqs[wi]
+            for pos in positions:
+                if not word_alive[wi][pos]:
+                    continue
+                j = word_next[wi][pos]
+                if j == -1:
+                    continue
+                if word_symbols[wi][pos] != a or word_symbols[wi][j] != b:
+                    continue
+                if word_prev[wi][j] != pos:
+                    continue
 
-            # Remove old pairs from counts and index
-            old_pair_counts: Counter[tuple[int, int]] = Counter()
-            for j in range(len(symbols) - 1):
-                old_pair_counts[(symbols[j], symbols[j + 1])] += 1
-            for pair, pair_count in old_pair_counts.items():
-                counts[pair] -= pair_count * freq
-                if counts[pair] <= 0:
-                    del counts[pair]
-                else:
-                    heapq.heappush(
-                        heap,
-                        (-counts[pair], inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
-                    )
+                prev_idx = word_prev[wi][pos]
+                next_idx = word_next[wi][j]
 
-            # Build merged chunk
-            new_symbols = []
-            new_pair_counts: Counter[tuple[int, int]] = Counter()
-            j = 0
-            last_new: int | None = None
-            while j < len(symbols):
-                if j < len(symbols) - 1 and symbols[j] == a and symbols[j + 1] == b:
-                    next_sym = new_token_id
-                    j += 2
-                else:
-                    next_sym = symbols[j]
-                    j += 1
-                if last_new is not None:
-                    new_pair_counts[(last_new, next_sym)] += 1
-                new_symbols.append(next_sym)
-                last_new = next_sym
+                # Remove old pairs from counts
+                _adjust_pair((a, b), -freq)
+                if prev_idx != -1:
+                    _adjust_pair((word_symbols[wi][prev_idx], a), -freq)
+                if next_idx != -1:
+                    _adjust_pair((b, word_symbols[wi][next_idx]), -freq)
 
-            # Add new pairs to counts and index
-            for pair, pair_count in new_pair_counts.items():
-                counts[pair] += pair_count * freq
-                pair_to_words[pair].append(wi)
-                heapq.heappush(
-                    heap,
-                    (-counts[pair], inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
-                )
+                # Merge nodes pos and j
+                word_symbols[wi][pos] = new_token_id
+                word_alive[wi][j] = False
+                word_prev[wi][j] = -1
+                word_next[wi][j] = -1
+                word_next[wi][pos] = next_idx
+                if next_idx != -1:
+                    word_prev[wi][next_idx] = pos
 
-            word_symbols[wi] = new_symbols
+                # Add new pairs to counts and index
+                if prev_idx != -1:
+                    new_left = (word_symbols[wi][prev_idx], new_token_id)
+                    _adjust_pair(new_left, freq)
+                    pair_to_occurrences[new_left].append((wi, prev_idx))
+                if next_idx != -1:
+                    new_right = (new_token_id, word_symbols[wi][next_idx])
+                    _adjust_pair(new_right, freq)
+                    pair_to_occurrences[new_right].append((wi, pos))
 
     final_merges = [(vocab[p[0]], vocab[p[1]]) for p in merges]
 
