@@ -1,5 +1,6 @@
 import heapq
 import os
+import time
 import multiprocessing as mp
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
@@ -7,10 +8,19 @@ from collections.abc import Iterable, Iterator
 import regex as re
 
 # Refer to https://github.com/openai/tiktoken/pull/234/changes
-GPT2_PATTERN = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+GPT2_PATTERN = re.compile(
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
 
 
-def _iter_documents_single(input_path: str | os.PathLike, token: str, chunk_size: int) -> Iterator[str]:
+def _inv_key(token_bytes: bytes) -> tuple[int, ...]:
+    # Reverse lexicographic order with an explicit terminator so prefixes sort after longer bytes.
+    return tuple(255 - b for b in token_bytes) + (256,)
+
+
+def _iter_documents_single(
+    input_path: str | os.PathLike, token: str, chunk_size: int
+) -> Iterator[str]:
     buffer = ""
     token_len = len(token)
     with open(input_path, encoding="utf-8") as f:
@@ -31,7 +41,9 @@ def _iter_documents_single(input_path: str | os.PathLike, token: str, chunk_size
         yield buffer
 
 
-def _iter_documents_multi(input_path: str | os.PathLike, special_tokens: list[str], chunk_size: int) -> Iterator[str]:
+def _iter_documents_multi(
+    input_path: str | os.PathLike, special_tokens: list[str], chunk_size: int
+) -> Iterator[str]:
     special_pattern = "|".join(re.escape(t) for t in special_tokens)
     special_regex = re.compile(special_pattern)
     buffer = ""
@@ -43,14 +55,16 @@ def _iter_documents_multi(input_path: str | os.PathLike, special_tokens: list[st
             buffer += chunk
             last_idx = 0
             for match in special_regex.finditer(buffer):
-                yield buffer[last_idx : match.start()]
+                yield buffer[last_idx:match.start()]
                 last_idx = match.end()
             buffer = buffer[last_idx:]
     if buffer:
         yield buffer
 
 
-def _batch_documents(doc_iter: Iterable[str], max_docs: int = 2048, max_chars: int = 1 << 20) -> Iterator[list[str]]:
+def _batch_documents(
+    doc_iter: Iterable[str], max_docs: int = 2048, max_chars: int = 1 << 20
+) -> Iterator[list[str]]:
     batch: list[str] = []
     total_chars = 0
     for doc in doc_iter:
@@ -87,12 +101,19 @@ def _num_workers() -> int:
     return max(1, cpu_count - 1)
 
 
-def train_bpe(
-    input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    # 1-3. Stream pretokenization into counts; avoid storing the full text
+def _resolve_workers(num_workers: int | None) -> int:
+    if num_workers is None:
+        return _num_workers()
+    return max(1, num_workers)
+
+
+def _pretokenize_counts(
+    input_path: str | os.PathLike,
+    special_tokens: list[str],
+    chunk_size: int,
+    num_workers: int,
+) -> Counter[bytes]:
     word_counts: Counter[bytes] = Counter()
-    chunk_size = 1 << 20
 
     if special_tokens:
         if len(special_tokens) == 1:
@@ -101,8 +122,7 @@ def train_bpe(
             doc_iter = _iter_documents_multi(input_path, special_tokens, chunk_size)
 
         batches = _batch_documents(doc_iter)
-        workers = _num_workers()
-        if workers <= 1:
+        if num_workers <= 1:
             for batch in batches:
                 word_counts.update(_count_docs(batch))
         else:
@@ -110,52 +130,55 @@ def train_bpe(
                 ctx = mp.get_context("fork")
             except ValueError:
                 ctx = mp.get_context()
-            with ctx.Pool(processes=workers) as pool:
+            with ctx.Pool(processes=num_workers) as pool:
                 for counts in pool.imap_unordered(_count_docs, batches, chunksize=1):
                     word_counts.update(counts)
-    else:
+        return word_counts
 
-        def _consume_segment(segment: str, carry: str, flush: bool) -> str:
-            if not segment and not carry:
-                return ""
-            buffer = carry + segment
-            last_match = None
-            for match in GPT2_PATTERN.finditer(buffer):
-                if last_match is not None:
-                    word_counts[last_match.group().encode("utf-8")] += 1
-                last_match = match
-            if last_match is None:
-                return buffer if not flush else ""
-            if flush or last_match.end() < len(buffer):
+    def _consume_segment(segment: str, carry: str, flush: bool) -> str:
+        if not segment and not carry:
+            return ""
+        buffer = carry + segment
+        last_match = None
+        for match in GPT2_PATTERN.finditer(buffer):
+            if last_match is not None:
                 word_counts[last_match.group().encode("utf-8")] += 1
-                return "" if last_match.end() == len(buffer) else buffer[last_match.end() :]
-            return buffer[last_match.start() :]
+            last_match = match
+        if last_match is None:
+            return buffer if not flush else ""
+        if flush or last_match.end() < len(buffer):
+            word_counts[last_match.group().encode("utf-8")] += 1
+            return "" if last_match.end() == len(buffer) else buffer[last_match.end() :]
+        return buffer[last_match.start() :]
 
-        carry = ""
-        with open(input_path, encoding="utf-8") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                carry = _consume_segment(chunk, carry, flush=False)
-        if carry:
-            carry = _consume_segment("", carry, flush=True)
+    carry = ""
+    with open(input_path, encoding="utf-8") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            carry = _consume_segment(chunk, carry, flush=False)
+    if carry:
+        carry = _consume_segment("", carry, flush=True)
 
-    # 4. Initialization
-    # Basic 256 bytes
-    def _inv_key(token_bytes: bytes) -> tuple[int, ...]:
-        # Reverse lexicographic order with an explicit terminator so prefixes sort after longer bytes.
-        return tuple(255 - b for b in token_bytes) + (256,)
+    return word_counts
 
+
+def _init_vocab_and_inv(
+    special_tokens: list[str],
+) -> tuple[dict[int, bytes], list[tuple[int, ...]]]:
     vocab = {i: bytes([i]) for i in range(256)}
     inv_vocab = [_inv_key(bytes([i])) for i in range(256)]
-    # Add special tokens to vocab
     for idx, token in enumerate(special_tokens):
         token_bytes = token.encode("utf-8")
         vocab[256 + idx] = token_bytes
         inv_vocab.append(_inv_key(token_bytes))
+    return vocab, inv_vocab
 
-    # Collapse duplicate words to avoid per-occurrence storage
+
+def _build_word_storage(
+    word_counts: Counter[bytes],
+) -> tuple[list[list[int]], list[int], list[list[int]], list[list[int]], list[list[bool]]]:
     word_symbols: list[list[int]] = []
     word_freqs: list[int] = []
     for word_bytes, freq in word_counts.items():
@@ -174,11 +197,18 @@ def train_bpe(
         word_next.append([i + 1 for i in range(n - 1)] + [-1])
         word_prev.append([-1] + [i for i in range(n - 1)])
         word_alive.append([True] * n)
+    return word_symbols, word_freqs, word_next, word_prev, word_alive
 
-    # 5. Merge
-    num_merges = vocab_size - 256 - len(special_tokens)
-    merges = []
 
+def _init_pair_stats(
+    word_symbols: list[list[int]],
+    word_freqs: list[int],
+    inv_vocab: list[tuple[int, ...]],
+) -> tuple[
+    Counter[tuple[int, int]],
+    defaultdict[tuple[int, int], list[tuple[int, int]]],
+    list[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, int]]],
+]:
     counts: Counter[tuple[int, int]] = Counter()
     pair_to_occurrences: defaultdict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
 
@@ -195,6 +225,24 @@ def train_bpe(
             heap,
             (-count, inv_vocab[pair[0]], inv_vocab[pair[1]], pair),
         )
+    return counts, pair_to_occurrences, heap
+
+
+def _merge_pairs(
+    num_merges: int,
+    merge_offset: int,
+    vocab: dict[int, bytes],
+    inv_vocab: list[tuple[int, ...]],
+    word_symbols: list[list[int]],
+    word_freqs: list[int],
+    word_next: list[list[int]],
+    word_prev: list[list[int]],
+    word_alive: list[list[bool]],
+    counts: Counter[tuple[int, int]],
+    pair_to_occurrences: defaultdict[tuple[int, int], list[tuple[int, int]]],
+    heap: list[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, int]]],
+) -> list[tuple[int, int]]:
+    merges: list[tuple[int, int]] = []
 
     def _pop_best_pair() -> tuple[int, int] | None:
         while heap:
@@ -218,22 +266,19 @@ def train_bpe(
         counts[pair] = new_count
         heapq.heappush(heap, (-new_count, inv_vocab[pair[0]], inv_vocab[pair[1]], pair))
 
-    # 6. Compute
     for i in range(num_merges):
         if not counts:
             break
         best_pair = _pop_best_pair()
         if best_pair is None:
             break
-        new_token_id = 256 + len(special_tokens) + i
+        new_token_id = merge_offset + i
 
         merges.append(best_pair)
         vocab[new_token_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
         inv_vocab.append(_inv_key(vocab[new_token_id]))
 
         a, b = best_pair
-
-        # Only process words that contain the best pair (skip all others)
         occurrences = pair_to_occurrences.pop(best_pair, [])
         affected_positions: dict[int, list[int]] = {}
         for wi, pos in occurrences:
@@ -265,14 +310,12 @@ def train_bpe(
                 prev_idx = word_prev[wi][pos]
                 next_idx = word_next[wi][j]
 
-                # Remove old pairs from counts
                 _adjust_pair((a, b), -freq)
                 if prev_idx != -1:
                     _adjust_pair((word_symbols[wi][prev_idx], a), -freq)
                 if next_idx != -1:
                     _adjust_pair((b, word_symbols[wi][next_idx]), -freq)
 
-                # Merge nodes pos and j
                 word_symbols[wi][pos] = new_token_id
                 word_alive[wi][j] = False
                 word_prev[wi][j] = -1
@@ -281,7 +324,6 @@ def train_bpe(
                 if next_idx != -1:
                     word_prev[wi][next_idx] = pos
 
-                # Add new pairs to counts and index
                 if prev_idx != -1:
                     new_left = (word_symbols[wi][prev_idx], new_token_id)
                     _adjust_pair(new_left, freq)
@@ -291,6 +333,86 @@ def train_bpe(
                     _adjust_pair(new_right, freq)
                     pair_to_occurrences[new_right].append((wi, pos))
 
-    final_merges = [(vocab[p[0]], vocab[p[1]]) for p in merges]
+    return merges
 
+
+def train_bpe(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
+    *,
+    num_workers: int | None = None,
+    profile: bool = False,
+    profile_data: dict[str, float] | None = None,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    timings = profile_data if profile_data is not None else {}
+
+    def _time_block(label: str, fn, *args):
+        if not profile:
+            return fn(*args)
+        start = time.perf_counter()
+        result = fn(*args)
+        timings[label] = time.perf_counter() - start
+        return result
+
+    chunk_size = 1 << 20
+    workers = _resolve_workers(num_workers)
+    word_counts = _time_block(
+        "pretokenize",
+        _pretokenize_counts,
+        input_path,
+        special_tokens,
+        chunk_size,
+        workers,
+    )
+
+    vocab, inv_vocab = _time_block("init_vocab", _init_vocab_and_inv, special_tokens)
+
+    word_symbols, word_freqs, word_next, word_prev, word_alive = _time_block(
+        "build_words", _build_word_storage, word_counts
+    )
+
+    counts, pair_to_occurrences, heap = _time_block(
+        "init_pairs", _init_pair_stats, word_symbols, word_freqs, inv_vocab
+    )
+
+    num_merges = vocab_size - 256 - len(special_tokens)
+    merge_offset = 256 + len(special_tokens)
+    merges = _time_block(
+        "merge",
+        _merge_pairs,
+        num_merges,
+        merge_offset,
+        vocab,
+        inv_vocab,
+        word_symbols,
+        word_freqs,
+        word_next,
+        word_prev,
+        word_alive,
+        counts,
+        pair_to_occurrences,
+        heap,
+    )
+
+    final_merges = [(vocab[p[0]], vocab[p[1]]) for p in merges]
     return vocab, final_merges
+
+
+def train_bpe_profile(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
+    *,
+    num_workers: int | None = None,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]], dict[str, float]]:
+    timings: dict[str, float] = {}
+    vocab, merges = train_bpe(
+        input_path,
+        vocab_size,
+        special_tokens,
+        num_workers=num_workers,
+        profile=True,
+        profile_data=timings,
+    )
+    return vocab, merges, timings
