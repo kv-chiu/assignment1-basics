@@ -1,6 +1,8 @@
 import heapq
 import os
+import multiprocessing as mp
 from collections import Counter, defaultdict
+from collections.abc import Iterable, Iterator
 
 import regex as re
 
@@ -8,62 +10,127 @@ import regex as re
 GPT2_PATTERN = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 
+def _iter_documents_single(input_path: str | os.PathLike, token: str, chunk_size: int) -> Iterator[str]:
+    buffer = ""
+    token_len = len(token)
+    with open(input_path, encoding="utf-8") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            buffer += chunk
+            start = 0
+            while True:
+                idx = buffer.find(token, start)
+                if idx == -1:
+                    break
+                yield buffer[start:idx]
+                start = idx + token_len
+            buffer = buffer[start:]
+    if buffer:
+        yield buffer
+
+
+def _iter_documents_multi(input_path: str | os.PathLike, special_tokens: list[str], chunk_size: int) -> Iterator[str]:
+    special_pattern = "|".join(re.escape(t) for t in special_tokens)
+    special_regex = re.compile(special_pattern)
+    buffer = ""
+    with open(input_path, encoding="utf-8") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            buffer += chunk
+            last_idx = 0
+            for match in special_regex.finditer(buffer):
+                yield buffer[last_idx : match.start()]
+                last_idx = match.end()
+            buffer = buffer[last_idx:]
+    if buffer:
+        yield buffer
+
+
+def _batch_documents(doc_iter: Iterable[str], max_docs: int = 2048, max_chars: int = 1 << 20) -> Iterator[list[str]]:
+    batch: list[str] = []
+    total_chars = 0
+    for doc in doc_iter:
+        if not doc:
+            continue
+        batch.append(doc)
+        total_chars += len(doc)
+        if len(batch) >= max_docs or total_chars >= max_chars:
+            yield batch
+            batch = []
+            total_chars = 0
+    if batch:
+        yield batch
+
+
+def _count_docs(docs: list[str]) -> Counter[bytes]:
+    counts: Counter[bytes] = Counter()
+    pattern = GPT2_PATTERN
+    for doc in docs:
+        for match in pattern.finditer(doc):
+            counts[match.group().encode("utf-8")] += 1
+    return counts
+
+
+def _num_workers() -> int:
+    env = os.getenv("BPE_NUM_WORKERS")
+    if env:
+        try:
+            value = int(env)
+            return max(1, value)
+        except ValueError:
+            pass
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count - 1)
+
+
 def train_bpe(
     input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     # 1-3. Stream pretokenization into counts; avoid storing the full text
     word_counts: Counter[bytes] = Counter()
-
-    def _consume_segment(segment: str, carry: str, flush: bool) -> str:
-        if not segment and not carry:
-            return ""
-        buffer = carry + segment
-        last_match = None
-        for match in GPT2_PATTERN.finditer(buffer):
-            if last_match is not None:
-                word_counts[last_match.group().encode("utf-8")] += 1
-            last_match = match
-        if last_match is None:
-            return buffer if not flush else ""
-        if flush or last_match.end() < len(buffer):
-            word_counts[last_match.group().encode("utf-8")] += 1
-            return "" if last_match.end() == len(buffer) else buffer[last_match.end() :]
-        return buffer[last_match.start() :]
-
     chunk_size = 1 << 20
+
     if special_tokens:
-        special_pattern = "|".join(re.escape(t) for t in special_tokens)
-        special_regex = re.compile(special_pattern)
-        max_special_len = max(len(t) for t in special_tokens)
-        buffer = ""
-        carry = ""
-        with open(input_path, encoding="utf-8") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                buffer += chunk
-                scan_upto = len(buffer) - (max_special_len - 1)
-                if scan_upto <= 0:
-                    continue
-                last_idx = 0
-                for match in special_regex.finditer(buffer):
-                    if match.start() >= scan_upto:
-                        break
-                    if match.start() > last_idx:
-                        carry = _consume_segment(buffer[last_idx:match.start()], carry, flush=False)
-                    carry = _consume_segment("", carry, flush=True)
-                    last_idx = match.end()
-                if last_idx > 0:
-                    buffer = buffer[last_idx:]
-                else:
-                    carry = _consume_segment(buffer[:scan_upto], carry, flush=False)
-                    buffer = buffer[scan_upto:]
-        if buffer:
-            carry = _consume_segment(buffer, carry, flush=False)
-        if carry:
-            carry = _consume_segment("", carry, flush=True)
+        if len(special_tokens) == 1:
+            doc_iter = _iter_documents_single(input_path, special_tokens[0], chunk_size)
+        else:
+            doc_iter = _iter_documents_multi(input_path, special_tokens, chunk_size)
+
+        batches = _batch_documents(doc_iter)
+        workers = _num_workers()
+        if workers <= 1:
+            for batch in batches:
+                word_counts.update(_count_docs(batch))
+        else:
+            try:
+                ctx = mp.get_context("fork")
+            except ValueError:
+                ctx = mp.get_context()
+            with ctx.Pool(processes=workers) as pool:
+                for counts in pool.imap_unordered(_count_docs, batches, chunksize=1):
+                    word_counts.update(counts)
     else:
+
+        def _consume_segment(segment: str, carry: str, flush: bool) -> str:
+            if not segment and not carry:
+                return ""
+            buffer = carry + segment
+            last_match = None
+            for match in GPT2_PATTERN.finditer(buffer):
+                if last_match is not None:
+                    word_counts[last_match.group().encode("utf-8")] += 1
+                last_match = match
+            if last_match is None:
+                return buffer if not flush else ""
+            if flush or last_match.end() < len(buffer):
+                word_counts[last_match.group().encode("utf-8")] += 1
+                return "" if last_match.end() == len(buffer) else buffer[last_match.end() :]
+            return buffer[last_match.start() :]
+
         carry = ""
         with open(input_path, encoding="utf-8") as f:
             while True:
@@ -167,7 +234,7 @@ def train_bpe(
         a, b = best_pair
 
         # Only process words that contain the best pair (skip all others)
-        occurrences = pair_to_occurrences.get(best_pair, [])
+        occurrences = pair_to_occurrences.pop(best_pair, [])
         affected_positions: dict[int, list[int]] = {}
         for wi, pos in occurrences:
             if not word_alive[wi][pos]:
