@@ -1,5 +1,7 @@
 \documentclass{article}
-\usepackage[utf8]{inputenc}
+\usepackage{fontspec}
+\usepackage[UTF8, scheme=plain]{ctex}
+\usepackage{emoji}
 \usepackage{geometry}
 \geometry{a4paper, margin=1in}
 
@@ -23,10 +25,28 @@
 
 \begin{enumerate}
     \item[(a)] UTF-8 is preferred because it is variable-width and highly space-efficient for ASCII characters (using 1 byte vs 2-4 bytes in UTF-16/32), which dominate most training corpora (like English text and code), and it avoids the issue of null-byte sparsity found in fixed-width encodings.
-    \item[(b)] "A中😀". The function fails to decode the bytes correctly because it does not handle multi-byte characters properly. It attempts to decode each byte as a separate character, which can lead to errors or unexpected results.
-    \item[(c)] "\xe4\x00". The sequence starts with "\xe4"(11100100), implicating that it is a 3-byte sequence. However, the second byte is "\x00"(00000000) instead of "10xxxxxx", so it is not a valid UTF-8 encoding of a character, and there are only two bytes available to decode.
+    \item[(b)] "A中\emoji{grinning-face}". The function fails to decode the bytes correctly because it does not handle multi-byte characters properly. It attempts to decode each byte as a separate character, which can lead to errors or unexpected results.
+    \item[(c)] \texttt{"\textbackslash xe4\textbackslash x00"}. The sequence starts with \texttt{"\textbackslash xe4"}(11100100), implicating that it is a 3-byte sequence. However, the second byte is \texttt{"\textbackslash x00"}(00000000) instead of "10xxxxxx", so it is not a valid UTF-8 encoding of a character, and there are only two bytes available to decode.
 \end{enumerate}
 
-\section*{Problem (train_bpe): BPE Tokenizer Training}
+\section*{Problem (train\_bpe): BPE Tokenizer Training}
+
+\begin{enumerate}
+    \item[] Implemented \texttt{pretokenize}, \texttt{init\_vocab}, \texttt{build\_words}, \texttt{init\_pairs}, \texttt{merge}.
+\end{enumerate}
+
+\section*{Problem (train\_bpe\_tinystories): BPE Training on TinyStories}
+
+\begin{enumerate}
+    \item[(a)] 320s in 4vcpu, 38.09s in 128vcpu, both took up about 3.4 GB RAM. Longest token (ID 7160): b' accomplishment'. 
+    \item[(b)] Pretokenize took the most time.
+\end{enumerate}
+
+\section*{Problem (train\_bpe\_expts\_owt): BPE Training on OpenWebText}
+
+\begin{enumerate}
+    \item[(a)] 3682.80s in 128vcpu. Longest token (ID 25851): b'\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82'. 
+    \item[(b)] Pretokenize took the most time.
+\end{enumerate}
 
 \end{document}
