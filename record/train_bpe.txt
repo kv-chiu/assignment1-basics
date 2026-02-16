@@ -1,0 +1,23 @@
+run_experiment("data/TinyStoriesV2-GPT4-train.txt", 10000, ["<|endoftext|>"], "TinyStoriesV2")
+
+Start training on data/TinyStoriesV2-GPT4-train.txt...
+Training completed in 38.09 seconds.
+pretokenize: 31.12s
+merge: 5.92s
+init_pairs: 0.46s
+build_words: 0.32s
+init_vocab: 0.00s
+Longest token (ID 7160): b' accomplishment'
+Length: 15
+
+run_experiment("data/owt_train.txt", 32000, [], "owt")
+
+Start training on data/owt_train.txt...
+Training completed in 3682.80 seconds.
+pretokenize: 2270.28s
+merge: 1252.01s
+build_words: 79.49s
+init_pairs: 33.81s
+init_vocab: 0.00s
+Longest token (ID 25851): b'\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82\xc3\x83\xc3\x82'
+Length: 64
